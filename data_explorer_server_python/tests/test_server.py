@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fastapi import HTTPException
+
 from data_explorer_server_python import main
 from data_explorer_server_python.schemas import ChartInput, PreviewInput
 
@@ -168,16 +170,40 @@ class DataExplorerServerTests(unittest.TestCase):
             csv_path = Path(tmpdir) / "cities.csv"
             csv_path.write_text("city,value\nSF,10\nNYC,20\n", encoding="utf-8")
 
-            upload_response = main._handle_upload(
-                {
-                    "datasetName": "Path Upload",
-                    "filePath": str(csv_path),
-                }
-            )
+            original_roots = main._ALLOWED_UPLOAD_ROOTS
+            main._ALLOWED_UPLOAD_ROOTS = (Path(tmpdir).resolve(),)
+            try:
+                upload_response = main._handle_upload(
+                    {
+                        "datasetName": "Path Upload",
+                        "filePath": str(csv_path),
+                    }
+                )
+            finally:
+                main._ALLOWED_UPLOAD_ROOTS = original_roots
 
             self.assertEqual(upload_response.dataset.dataset_name, "Path Upload")
             self.assertEqual(upload_response.dataset.filename, "cities.csv")
             self.assertEqual(upload_response.dataset.row_count, 2)
+
+    def test_upload_via_file_path_rejected_without_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            csv_path = Path(tmpdir) / "cities.csv"
+            csv_path.write_text("city,value\nSF,10\nNYC,20\n", encoding="utf-8")
+
+            original_roots = main._ALLOWED_UPLOAD_ROOTS
+            main._ALLOWED_UPLOAD_ROOTS = ()
+
+            try:
+                with self.assertRaises(HTTPException):
+                    main._handle_upload(
+                        {
+                            "datasetName": "Blocked Path",
+                            "filePath": str(csv_path),
+                        }
+                    )
+            finally:
+                main._ALLOWED_UPLOAD_ROOTS = original_roots
 
 
 if __name__ == "__main__":

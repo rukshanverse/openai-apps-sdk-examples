@@ -11,6 +11,7 @@ from uuid import uuid4
 import logging
 import os
 import re
+import secrets
 from urllib.parse import urlparse, unquote
 
 import pandas as pd
@@ -57,6 +58,15 @@ EMPTY_INPUT_SCHEMA: Dict[str, Any] = {
 }
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB default limit
 UPLOAD_SESSION_TTL_SECONDS = 20 * 60  # 20 minutes
+PATH_ALLOWLIST_ENV = "DATA_EXPLORER_ALLOWED_UPLOAD_ROOTS"
+AUTH_TOKEN_ENV = "DATA_EXPLORER_AUTH_TOKEN"
+CORS_ORIGINS_ENV = "DATA_EXPLORER_CORS_ALLOW_ORIGINS"
+PATH_UPLOAD_DISABLED_MESSAGE = (
+    "filePath/fileUri uploads are disabled. Provide csvText or set "
+    f"{PATH_ALLOWLIST_ENV} to allow specific directories."
+)
+
+SECURITY_LOGGER = logging.getLogger("data_explorer_server.security")
 
 _SCRIPT_TAG_PATTERN = re.compile(
     r"<script[^>]*src=\"[^\"]*/(?P<filename>[\w.-]+\.js)\"[^>]*></script>",
@@ -67,6 +77,46 @@ _STYLESHEET_LINK_PATTERN = re.compile(
     r"<link[^>]*href=\"[^\"]*/(?P<filename>[\w.-]+\.css)\"[^>]*/?>",
     re.IGNORECASE,
 )
+
+
+def _parse_path_allowlist(raw_value: Optional[str]) -> tuple[Path, ...]:
+    if not raw_value:
+        return ()
+
+    roots: List[Path] = []
+    for entry in raw_value.split(os.pathsep):
+        candidate = entry.strip()
+        if not candidate:
+            continue
+        try:
+            resolved = Path(candidate).expanduser().resolve(strict=False)
+        except OSError as exc:
+            SECURITY_LOGGER.warning(
+                "Ignoring invalid path in %s (%s): %s",
+                PATH_ALLOWLIST_ENV,
+                candidate,
+                exc,
+            )
+            continue
+        roots.append(resolved)
+    return tuple(roots)
+
+
+def _ensure_path_within_allowlist(resolved_path: Path) -> None:
+    if not _ALLOWED_UPLOAD_ROOTS:
+        raise HTTPException(status_code=400, detail=PATH_UPLOAD_DISABLED_MESSAGE)
+
+    for root in _ALLOWED_UPLOAD_ROOTS:
+        try:
+            resolved_path.relative_to(root)
+            return
+        except ValueError:
+            continue
+
+    raise HTTPException(
+        status_code=403,
+        detail="Requested file path is outside the configured allowlist.",
+    )
 
 
 def _load_widget_assets() -> tuple[str, Optional[str], Optional[str]]:
@@ -83,7 +133,7 @@ def _load_widget_assets() -> tuple[str, Optional[str], Optional[str]]:
     if html_source is None:
         # Provide minimal shell if assets missing.
         return (
-            """<!doctype html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n  </head>\n  <body>\n    <div id=\"data-explorer-root\"></div>\n  </body>\n</html>\n""",
+            """<!doctype html>\n<html>\n  <head>\n    <meta charset=\"utf-8\" />\n    <style>\n      body { font-family: system-ui, sans-serif; padding: 1rem; }\n    </style>\n  </head>\n  <body>\n    <div id=\"data-explorer-root\"></div>\n    <script type=\"module\">\n      console.warn(\"Data Explorer bundle missing from assets/. Run 'pnpm run build' to generate it.\");\n    </script>\n  </body>\n</html>\n""",
             None,
             None,
         )
@@ -306,13 +356,18 @@ def _extract_path_from_payload(payload: UploadDatasetInput) -> Optional[Path]:
 
 
 def _read_csv_from_path(path: Path, desired_encoding: Optional[str]) -> str:
+    candidate = path.expanduser()
     try:
-        resolved_path = path.resolve(strict=False)
-    except OSError:
-        resolved_path = path
+        resolved_path = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"File not found: {candidate}")
+    except OSError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Unable to resolve upload path: {exc}"
+        ) from exc
 
-    if not resolved_path.exists():
-        raise HTTPException(status_code=404, detail=f"File not found: {resolved_path}")
+    _ensure_path_within_allowlist(resolved_path)
+
     if not resolved_path.is_file():
         raise HTTPException(
             status_code=400,
@@ -399,6 +454,14 @@ def _csv_to_dataframe(csv_text: str, payload: UploadDatasetInput) -> pd.DataFram
 
 
 _WIDGET_HTML, _WIDGET_SCRIPT, _WIDGET_STYLE = _load_widget_assets()
+
+_ALLOWED_UPLOAD_ROOTS = _parse_path_allowlist(os.getenv(PATH_ALLOWLIST_ENV))
+_AUTH_TOKEN = os.getenv(AUTH_TOKEN_ENV)
+_CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in (os.getenv(CORS_ORIGINS_ENV) or "").split(",")
+    if origin.strip()
+]
 
 store = DatasetStore()
 upload_manager = UploadSessionManager(MAX_UPLOAD_BYTES, UPLOAD_SESSION_TTL_SECONDS)
@@ -846,6 +909,22 @@ mcp._mcp_server.request_handlers[types.CallToolRequest] = _on_call_tool
 app = mcp.streamable_http_app()
 
 
+@app.middleware("http")
+async def _enforce_bearer_token(request: Request, call_next):
+    if not _AUTH_TOKEN:
+        return await call_next(request)
+
+    header_value = request.headers.get("authorization")
+    if not header_value or not header_value.startswith("Bearer "):
+        return JSONResponse({"error": "Missing bearer token"}, status_code=401)
+
+    provided = header_value.split(" ", 1)[1].strip()
+    if not provided or not secrets.compare_digest(provided, _AUTH_TOKEN):
+        return JSONResponse({"error": "Invalid bearer token"}, status_code=403)
+
+    return await call_next(request)
+
+
 async def _health_endpoint(request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
@@ -862,13 +941,14 @@ app.add_route("/health", _health_endpoint, methods=["GET"])
 try:
     from starlette.middleware.cors import CORSMiddleware
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-        allow_credentials=False,
-    )
+    if _CORS_ALLOWED_ORIGINS:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=_CORS_ALLOWED_ORIGINS,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            allow_credentials=False,
+        )
 except Exception:  # pragma: no cover - optional dependency
     pass
 

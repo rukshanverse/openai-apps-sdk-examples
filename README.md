@@ -133,6 +133,23 @@ uvicorn data_explorer_server_python.main:app --port 8001 --reload
 
 This server accepts CSV uploads, profiles dataset metadata, exposes filtered preview tables, and generates chart-ready aggregates. Built assets are served directly by the MCP server, so rerun `pnpm run build` whenever you update the widget bundle.
 
+#### Data Explorer security configuration
+
+- `DATA_EXPLORER_ALLOWED_UPLOAD_ROOTS` (required for `filePath`/`fileUri` uploads) – os-path-separated list of directories (e.g., `/tmp:/Users/me/datasets`). Path-based uploads are disabled unless this allowlist is set.
+- `DATA_EXPLORER_AUTH_TOKEN` – when set, every HTTP request (including MCP transport) must send `Authorization: Bearer <token>`.
+- `DATA_EXPLORER_CORS_ALLOW_ORIGINS` – comma-delimited list of origins (e.g., `https://platform.openai.com,https://studio.openai.com`) that should receive CORS headers. CORS is disabled when this variable is unset.
+
+If you expose the server over the public internet, configure all three variables to avoid leaking local files or running an unauthenticated, cross-origin-accessible endpoint.
+
+For local development you can continue testing path uploads by pointing the allowlist at directories you control, for example:
+
+```bash
+export DATA_EXPLORER_ALLOWED_UPLOAD_ROOTS="$(pwd)/sample-data:/tmp"
+uvicorn data_explorer_server_python.main:app --port 8001 --reload
+```
+
+Inline (`csvText`) and chunked uploads do not require any of the security environment variables, so you can omit them when doing quick experiments.
+
 ## Testing in ChatGPT
 
 To add these apps to ChatGPT, enable [developer mode](https://platform.openai.com/docs/guides/developer-mode), and add your apps in Settings > Connectors.
